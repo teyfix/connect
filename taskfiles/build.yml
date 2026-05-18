@@ -107,3 +107,10 @@ tasks:
     desc: Clean build artifacts
     cmds:
       - rm -rf {{.TARGET_DIR}}
+
+  language-server:
+    desc: Build language server
+    env:
+      CGO_ENABLED: 0
+    cmds:
+      - '{{.GO_BUILD_CMD}} -o {{.TARGET_DIR}}/language-server ./cmd/language-server'
