@@ -21,19 +21,24 @@ import (
 const lsName = "bloblang"
 
 var version = "0.0.1"
+var bloblangCompletionCache []protocol.CompletionItem
 
 func main() {
+	log.Printf("[main] Building Bloblang completion cache...")
+	buildBloblangCache()
+
 	log.Printf("[main] Starting LSP server...")
 
 	commonlog.Configure(1, nil)
 	handler := protocol.Handler{
-		Initialize:            initialize,
-		Initialized:           initialized,
-		Shutdown:              shutdown,
-		SetTrace:              setTrace,
-		TextDocumentDidOpen:   didOpen,
-		TextDocumentDidChange: didChange,
-		TextDocumentDidClose:  didClose,
+		Initialize:             initialize,
+		Initialized:            initialized,
+		Shutdown:               shutdown,
+		SetTrace:               setTrace,
+		TextDocumentDidOpen:    didOpen,
+		TextDocumentDidChange:  didChange,
+		TextDocumentDidClose:   didClose,
+		TextDocumentCompletion: completion,
 	}
 
 	s := server.NewServer(&handler, lsName, false)
@@ -78,7 +83,63 @@ func handlerCapabilities() protocol.ServerCapabilities {
 			OpenClose: &openClose,
 			Change:    &syncKind,
 		},
+		CompletionProvider: &protocol.CompletionOptions{
+			TriggerCharacters: []string{".", "@", "$"},
+		},
 	}
+}
+
+func buildBloblangCache() []protocol.CompletionItem {
+	var items []protocol.CompletionItem
+	env := bloblang.GlobalEnvironment()
+
+	kindFunc := protocol.CompletionItemKindFunction
+	kindMethod := protocol.CompletionItemKindMethod
+
+	// 1. Populate global Bloblang Functions
+	env.WalkFunctions(func(name string, view *bloblang.FunctionView) {
+		data := view.TemplateData()
+		detailText := "Bloblang Function"
+		if data.Category != "" {
+			detailText = fmt.Sprintf("Function (%s)", data.Category)
+		}
+		docText := data.Description
+
+		items = append(items, protocol.CompletionItem{
+			Label:         name,
+			Kind:          &kindFunc,
+			Detail:        &detailText,
+			Documentation: docText,
+		})
+	})
+
+	// 2. Populate global Bloblang Methods
+	env.WalkMethods(func(name string, view *bloblang.MethodView) {
+		data := view.TemplateData()
+		detailText := "Bloblang Method"
+		docText := data.Description
+
+		items = append(items, protocol.CompletionItem{
+			Label:         name,
+			Kind:          &kindMethod,
+			Detail:        &detailText,
+			Documentation: docText,
+		})
+	})
+
+	return items
+}
+
+func completion(context *glsp.Context, params *protocol.CompletionParams) (any, error) {
+	log.Printf("[completion] received event for %s", params.TextDocument.URI)
+
+	// Lazy-load the cache on the very first request
+	if bloblangCompletionCache == nil {
+		log.Println("[completion] Populating Bloblang completion cache...")
+		bloblangCompletionCache = buildBloblangCache()
+	}
+
+	return bloblangCompletionCache, nil
 }
 
 func didOpen(ctx *glsp.Context, params *protocol.DidOpenTextDocumentParams) error {
