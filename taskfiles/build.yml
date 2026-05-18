@@ -113,4 +113,14 @@ tasks:
     env:
       CGO_ENABLED: 0
     cmds:
-      - '{{.GO_BUILD_CMD}} -o {{.TARGET_DIR}}/language-server ./cmd/language-server'
+      - for: { matrix: { OS: [linux, darwin, windows], ARCH: [amd64, arm64] } }
+        task: language-server:target
+        vars:
+          OS: "{{.ITEM.OS}}"
+          ARCH: "{{.ITEM.ARCH}}"
+
+  language-server:target:
+    env:
+      CGO_ENABLED: 0
+    cmds:
+      - 'GOOS={{.OS}} GOARCH={{.ARCH}} {{.GO_BUILD_CMD}} -o {{.TARGET_DIR}}/language-server-{{.OS}}-{{.ARCH}}{{if eq .OS "windows"}}.exe{{end}} ./cmd/language-server'
