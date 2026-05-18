@@ -611,6 +611,70 @@ func buildBloblangCache() []protocol.CompletionItem {
 	return items
 }
 
+// ─── Completion context helpers ───────────────────────────────────────────────
+
+// getCompletionContext inspects the text before the cursor to decide whether
+// the user is completing a method call (after '.'), a variable (after '$' or
+// '@'), or a general expression where a function name is expected.
+// It returns "" when the context cannot be determined confidently.
+func getCompletionContext(lines []string, lineIdx, col int) string {
+	if lineIdx < 0 || lineIdx >= len(lines) {
+		return ""
+	}
+
+	// If the cursor sits inside or just after an identifier, walk back to
+	// the character preceding that identifier so we see the real delimiter.
+	c := col - 1
+	if c >= 0 {
+		line := lines[lineIdx]
+		for c >= 0 && isIdentChar(line[c]) {
+			c--
+		}
+	}
+
+	// Walk backward across whitespace and line breaks.
+	l := lineIdx
+	for l >= 0 {
+		line := lines[l]
+		for c >= 0 {
+			ch := line[c]
+			if ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' {
+				c--
+				continue
+			}
+			switch ch {
+			case '.':
+				return "method"
+			case '$', '@':
+				return "variable"
+			case '=', '(', ',', '{', '[', ';', '|', '&', '+', '-', '*', '/', '%', '!', '>', '<', '~':
+				return "function"
+			}
+			// Any other character (e.g. ')', ']', '}', string quote, or an
+			// identifier char that we didn't skip) means we're inside or
+			// adjacent to an existing expression; we can't narrow the context.
+			return ""
+		}
+		l--
+		if l >= 0 {
+			c = len(lines[l]) - 1
+		}
+	}
+	// Start of document → start of an expression.
+	return "function"
+}
+
+// filterCompletions returns only the items whose Kind matches the requested kind.
+func filterCompletions(items []protocol.CompletionItem, kind protocol.CompletionItemKind) []protocol.CompletionItem {
+	var out []protocol.CompletionItem
+	for _, it := range items {
+		if it.Kind != nil && *it.Kind == kind {
+			out = append(out, it)
+		}
+	}
+	return out
+}
+
 // ─── LSP handlers ─────────────────────────────────────────────────────────────
 
 func completion(context *glsp.Context, params *protocol.CompletionParams) (any, error) {
@@ -621,6 +685,40 @@ func completion(context *glsp.Context, params *protocol.CompletionParams) (any, 
 		bloblangCompletionCache = buildBloblangCache()
 	}
 
+	text := getDocument(params.TextDocument.URI)
+	if text != "" {
+		lines := strings.Split(text, "\n")
+		lineIdx := int(params.Position.Line)
+		col := int(params.Position.Character)
+
+		if lineIdx >= 0 && lineIdx < len(lines) {
+			ctx := getCompletionContext(lines, lineIdx, col)
+			log.Printf("[completion] detected context=%q", ctx)
+
+			switch ctx {
+			case "method":
+				filtered := filterCompletions(bloblangCompletionCache, protocol.CompletionItemKindMethod)
+				if len(filtered) > 0 {
+					log.Printf("[completion] returning %d method completions", len(filtered))
+					return filtered, nil
+				}
+				log.Printf("[completion] no method completions found, falling back")
+			case "function":
+				filtered := filterCompletions(bloblangCompletionCache, protocol.CompletionItemKindFunction)
+				if len(filtered) > 0 {
+					log.Printf("[completion] returning %d function completions", len(filtered))
+					return filtered, nil
+				}
+				log.Printf("[completion] no function completions found, falling back")
+			case "variable":
+				// We don't currently cache variable completions.
+				log.Printf("[completion] variable context, no completions available")
+				return []protocol.CompletionItem{}, nil
+			}
+		}
+	}
+
+	log.Printf("[completion] returning full cache (%d items)", len(bloblangCompletionCache))
 	return bloblangCompletionCache, nil
 }
 
