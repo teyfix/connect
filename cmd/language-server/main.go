@@ -8,7 +8,9 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/redpanda-data/benthos/v4/public/bloblang"
 	_ "github.com/redpanda-data/connect/public/bundle/free/v4"
@@ -22,12 +24,44 @@ import (
 const lsName = "bloblang"
 
 var version = "0.0.1"
+var bloblangDocsUrl = "https://docs.redpanda.com/redpanda-connect/guides/bloblang"
 var bloblangCompletionCache []protocol.CompletionItem
+var bloblangFunctionDocs map[string]bloblang.TemplateFunctionData
+var bloblangMethodDocs map[string]bloblang.TemplateMethodData
+
+var kebabDelimiter = regexp.MustCompile(`[^a-z0-9]+`)
 
 // includeDeprecated controls whether deprecated functions/methods appear in
 // completions. When true they are included with a visual warning prefix and the
 // LSP deprecated tag. Set to true during migration work if needed.
 const includeDeprecated = false
+
+// ─── Document store ───────────────────────────────────────────────────────────
+
+var (
+	documentStore   = make(map[string]string)
+	documentStoreMu sync.RWMutex
+)
+
+func getDocument(uri string) string {
+	documentStoreMu.RLock()
+	defer documentStoreMu.RUnlock()
+	return documentStore[uri]
+}
+
+func setDocument(uri, text string) {
+	documentStoreMu.Lock()
+	defer documentStoreMu.Unlock()
+	documentStore[uri] = text
+}
+
+func removeDocument(uri string) {
+	documentStoreMu.Lock()
+	defer documentStoreMu.Unlock()
+	delete(documentStore, uri)
+}
+
+// ─── Main & LSP handlers ──────────────────────────────────────────────────────
 
 func main() {
 	log.Printf("[main] Building Bloblang completion cache...")
@@ -278,10 +312,16 @@ func renderCodeBlock(value string) string {
 	return "```txt\n" + value + "\n```\n"
 }
 
+func toKebabCase(s string) string {
+	return kebabDelimiter.ReplaceAllString(strings.ToLower(s), "-")
+}
+
 // buildDocumentation assembles a Markdown MarkupContent value from all
 // available metadata: status badge, description, examples (with input/output
 // tables), method categories, and version footer.
 func buildDocumentation(
+	name string,
+	kind string,
 	description string,
 	examples []bloblang.TemplateExampleData,
 	categories []bloblang.TemplateMethodCategoryData,
@@ -289,6 +329,8 @@ func buildDocumentation(
 	status string,
 ) protocol.MarkupContent {
 	var sb strings.Builder
+
+	sb.WriteString(fmt.Sprintf("# [%s](%s/%s/#%s) – %s\n\n", name, bloblangDocsUrl, kind, name, kind))
 
 	// Status badge — shown at the top so it's immediately visible on hover.
 	switch status {
@@ -308,7 +350,7 @@ func buildDocumentation(
 	// Examples section — capped at 3 to keep hover docs readable.
 	const maxExamples = 3
 	if len(examples) > 0 {
-		sb.WriteString("**Examples**\n\n")
+		sb.WriteString("## Examples\n\n")
 
 		shown := examples
 		truncated := 0
@@ -319,7 +361,7 @@ func buildDocumentation(
 
 		for i, ex := range shown {
 			if ex.Summary != "" {
-				sb.WriteString("_" + ex.Summary + "_\n\n")
+				sb.WriteString(strings.ReplaceAll(fmt.Sprintf("%s\n\n", ex.Summary), "#####", "###"))
 			}
 
 			sb.WriteString("### Mapping\n\n")
@@ -330,23 +372,17 @@ func buildDocumentation(
 			// Render the input→output table only when the example is tested
 			// (SkipTesting examples may produce different results in practice).
 			if len(ex.Results) > 0 && !ex.SkipTesting {
-				for j, r := range ex.Results {
+				for _, r := range ex.Results {
 					// Escape pipe characters so the Markdown table stays valid.
 
-					suffix := ""
-
-					if len(shown) > 1 {
-						suffix = fmt.Sprintf(" — Example #%d", j+1)
-					}
-
 					sb.WriteString(
-						fmt.Sprintf("#### Input%s\n\n", suffix),
+						fmt.Sprintf("#### Input\n\n"),
 					)
 					sb.WriteString(renderCodeBlock(r[0]))
 					sb.WriteString("\n")
 
 					sb.WriteString(
-						fmt.Sprintf("#### Output%s\n\n", suffix),
+						fmt.Sprintf("#### Output\n\n"),
 					)
 					sb.WriteString(renderCodeBlock(r[1]))
 					sb.WriteString("\n")
@@ -371,16 +407,15 @@ func buildDocumentation(
 
 	// Method categories — only present for MethodView items.
 	if len(categories) > 0 {
-		var catNames []string
-		for _, c := range categories {
-			catNames = append(catNames, c.Category)
-		}
-		sb.WriteString("**Categories:** " + strings.Join(catNames, ", ") + "\n\n")
+		sb.WriteString("## Categories\n")
 
-		// If a category carries its own description, surface it as a sub-note.
 		for _, c := range categories {
+			sb.WriteString(
+				fmt.Sprintf("### [%s](%s/methods/#%s)\n\n", c.Category, bloblangDocsUrl, toKebabCase(c.Category)),
+			)
+
 			if c.Description != "" {
-				sb.WriteString(fmt.Sprintf("_%s_: %s\n\n", c.Category, c.Description))
+				sb.WriteString(fmt.Sprintf("%s\n\n", c.Description))
 			}
 		}
 	}
@@ -431,7 +466,7 @@ func buildFunctionItem(
 		sortText += "_z" // push named-args variant just below the base item
 	}
 
-	doc := buildDocumentation(data.Description, data.Examples, nil, data.Version, data.Status)
+	doc := buildDocumentation(data.Name, "functions", data.Description, data.Examples, nil, data.Version, data.Status)
 
 	item := protocol.CompletionItem{
 		Label:            label,
@@ -484,7 +519,7 @@ func buildMethodItem(
 		sortText += "_z"
 	}
 
-	doc := buildDocumentation(data.Description, data.Examples, data.Categories, data.Version, data.Status)
+	doc := buildDocumentation(data.Name, "methods", data.Description, data.Examples, data.Categories, data.Version, data.Status)
 
 	item := protocol.CompletionItem{
 		Label:            label,
@@ -506,6 +541,9 @@ func buildMethodItem(
 // ─── Cache builder ────────────────────────────────────────────────────────────
 
 func buildBloblangCache() []protocol.CompletionItem {
+	bloblangFunctionDocs = make(map[string]bloblang.TemplateFunctionData)
+	bloblangMethodDocs = make(map[string]bloblang.TemplateMethodData)
+
 	var items []protocol.CompletionItem
 	env := bloblang.GlobalEnvironment()
 
@@ -524,6 +562,8 @@ func buildBloblangCache() []protocol.CompletionItem {
 				return
 			}
 		}
+
+		bloblangFunctionDocs[name] = data
 
 		snippet, signature := generatePositionalSnippet(data.Params)
 		items = append(items, buildFunctionItem(data, name, snippet, signature, kindFunc, false))
@@ -548,6 +588,8 @@ func buildBloblangCache() []protocol.CompletionItem {
 				return
 			}
 		}
+
+		bloblangMethodDocs[name] = data
 
 		snippet, signature := generatePositionalSnippet(data.Params)
 		items = append(items, buildMethodItem(data, name, snippet, signature, kindMethod, false))
@@ -578,6 +620,8 @@ func didOpen(ctx *glsp.Context, params *protocol.DidOpenTextDocumentParams) erro
 	uri := params.TextDocument.URI
 	text := params.TextDocument.Text
 
+	setDocument(uri, text)
+
 	log.Printf("[didOpen] received event: %s", uri)
 	log.Printf("[didOpen] extracted content: %d bytes", len(text))
 
@@ -607,10 +651,77 @@ func hover(context *glsp.Context, params *protocol.HoverParams) (*protocol.Hover
 		)
 	} else {
 		log.Printf("[hover:WorkDoneProgressParams:WorkDoneToken] nil")
-
 	}
 
-	return nil, nil
+	// Ensure caches are ready.
+	if bloblangFunctionDocs == nil || bloblangMethodDocs == nil {
+		bloblangCompletionCache = buildBloblangCache()
+	}
+
+	text := getDocument(params.TextDocument.URI)
+	if text == "" {
+		log.Printf("[hover] no document content for %s", params.TextDocument.URI)
+		return nil, nil
+	}
+
+	lines := strings.Split(text, "\n")
+	lineIdx := int(params.Position.Line)
+	if lineIdx < 0 || lineIdx >= len(lines) {
+		log.Printf("[hover] line %d out of range (total %d)", lineIdx, len(lines))
+		return nil, nil
+	}
+
+	line := lines[lineIdx]
+	col := int(params.Position.Character)
+	if col > len(line) {
+		col = len(line)
+	}
+
+	token, tokenStart, tokenEnd, isMethod := findTokenAtPosition(lines, lineIdx, col)
+	if token == "" {
+		log.Printf("[hover] no token found at line %d char %d", lineIdx, col)
+		return nil, nil
+	}
+
+	log.Printf("[hover] token=%q isMethod=%v range=%d:%d", token, isMethod, tokenStart, tokenEnd)
+
+	// Only show hover when the token is followed by '(' — i.e. a function or
+	// method call. Field accesses like 'this.foo.bar' (where 'foo' is not
+	// followed by '(') are ignored.
+	if !isFunctionCallContext(line, tokenEnd) {
+		log.Printf("[hover] token %q not followed by '(', skipping", token)
+		return nil, nil
+	}
+
+	var doc protocol.MarkupContent
+	var found bool
+
+	if isMethod {
+		if data, ok := bloblangMethodDocs[token]; ok {
+			doc = buildDocumentation(data.Name, "methods", data.Description, data.Examples, data.Categories, data.Version, data.Status)
+			found = true
+			log.Printf("[hover] found method docs for %q", token)
+		}
+	} else {
+		if data, ok := bloblangFunctionDocs[token]; ok {
+			doc = buildDocumentation(data.Name, "functions", data.Description, data.Examples, nil, data.Version, data.Status)
+			found = true
+			log.Printf("[hover] found function docs for %q", token)
+		}
+	}
+
+	if !found {
+		log.Printf("[hover] no docs found for %q", token)
+		return nil, nil
+	}
+
+	return &protocol.Hover{
+		Contents: doc,
+		Range: &protocol.Range{
+			Start: protocol.Position{Line: protocol.UInteger(lineIdx), Character: protocol.UInteger(tokenStart)},
+			End:   protocol.Position{Line: protocol.UInteger(lineIdx), Character: protocol.UInteger(tokenEnd)},
+		},
+	}, nil
 }
 
 func didChange(ctx *glsp.Context, params *protocol.DidChangeTextDocumentParams) error {
@@ -631,6 +742,8 @@ func didChange(ctx *glsp.Context, params *protocol.DidChangeTextDocumentParams) 
 		text = change.Text
 	}
 
+	setDocument(uri, text)
+
 	log.Printf("[didChange] extracted content: %d bytes", len(text))
 
 	validateMapping(ctx, uri, text)
@@ -639,8 +752,109 @@ func didChange(ctx *glsp.Context, params *protocol.DidChangeTextDocumentParams) 
 }
 
 func didClose(ctx *glsp.Context, params *protocol.DidCloseTextDocumentParams) error {
-	log.Printf("[didClose] received event: %s", params.TextDocument.URI)
+	uri := params.TextDocument.URI
+	removeDocument(uri)
+	log.Printf("[didClose] received event: %s", uri)
 	return nil
+}
+
+// ─── Token extraction helpers ─────────────────────────────────────────────────
+
+func isIdentChar(c byte) bool {
+	return (c >= 'a' && c <= 'z') ||
+		(c >= 'A' && c <= 'Z') ||
+		(c >= '0' && c <= '9') ||
+		c == '_'
+}
+
+// findTokenAtPosition extracts the identifier under (or adjacent to) the cursor.
+// It also determines whether the token is a method call by looking backward for
+// a '.' separator (crossing line breaks when necessary).
+func findTokenAtPosition(lines []string, lineIdx, col int) (token string, tokenStart, tokenEnd int, isMethod bool) {
+	if lineIdx < 0 || lineIdx >= len(lines) {
+		return "", 0, 0, false
+	}
+
+	line := lines[lineIdx]
+	if col > len(line) {
+		col = len(line)
+	}
+
+	// If the cursor is not directly on an identifier char, nudge it onto one.
+	if col < len(line) && !isIdentChar(line[col]) {
+		if col > 0 && isIdentChar(line[col-1]) {
+			col--
+		} else {
+			for col < len(line) && !isIdentChar(line[col]) {
+				col++
+			}
+			if col >= len(line) {
+				return "", 0, 0, false
+			}
+		}
+	}
+
+	if col >= len(line) || !isIdentChar(line[col]) {
+		return "", 0, 0, false
+	}
+
+	// Walk backward to token start.
+	start := col
+	for start > 0 && isIdentChar(line[start-1]) {
+		start--
+	}
+
+	// Walk forward to token end.
+	end := col
+	for end < len(line) && isIdentChar(line[end]) {
+		end++
+	}
+
+	token = line[start:end]
+	if token == "" {
+		return "", 0, 0, false
+	}
+
+	isMethod = isMethodContext(lines, lineIdx, start)
+	return token, start, end, isMethod
+}
+
+// isMethodContext walks backward from the token start skipping whitespace and
+// line breaks. If it encounters a '.' before any other non-whitespace character
+// it reports true (method call). Any other character (including '$', '@', '(')
+// means false.
+func isMethodContext(lines []string, lineIdx, startCol int) bool {
+	col := startCol - 1
+	for lineIdx >= 0 {
+		line := lines[lineIdx]
+		for col >= 0 {
+			c := line[col]
+			if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
+				col--
+				continue
+			}
+			return c == '.'
+		}
+		lineIdx--
+		if lineIdx >= 0 {
+			col = len(lines[lineIdx]) - 1
+		}
+	}
+	return false
+}
+
+// isFunctionCallContext checks whether the token is followed by '(' on the
+// same line (skipping whitespace). This confirms it's a function or method
+// invocation rather than a field access.
+func isFunctionCallContext(line string, endCol int) bool {
+	for i := endCol; i < len(line); i++ {
+		c := line[i]
+		if c == ' ' || c == '\t' || c == '\r' {
+			continue
+		}
+		return c == '('
+	}
+	return false
 }
 
 // ─── Validation ───────────────────────────────────────────────────────────────
