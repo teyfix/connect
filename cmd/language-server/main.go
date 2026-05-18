@@ -304,7 +304,9 @@ func renderCodeBlock(value string) string {
 	if err := json.Unmarshal([]byte(value), &parsed); err == nil {
 		pretty, err := json.MarshalIndent(parsed, "", "  ")
 		if err == nil {
-			return "```json\n" + string(pretty) + "\n```\n"
+			single := regexp.MustCompile(`\n\s*`).ReplaceAllString(string(pretty), " ")
+
+			return "```json\n" + single + "\n```\n"
 		}
 	}
 
@@ -372,17 +374,23 @@ func buildDocumentation(
 			// Render the input→output table only when the example is tested
 			// (SkipTesting examples may produce different results in practice).
 			if len(ex.Results) > 0 && !ex.SkipTesting {
-				for _, r := range ex.Results {
+				for j, r := range ex.Results {
 					// Escape pipe characters so the Markdown table stays valid.
 
+					suffix := ""
+
+					if len(ex.Results) > 1 {
+						suffix = fmt.Sprintf(" – #%d", j+1)
+					}
+
 					sb.WriteString(
-						fmt.Sprintf("#### Input\n\n"),
+						fmt.Sprintf("#### Input%s\n\n", suffix),
 					)
 					sb.WriteString(renderCodeBlock(r[0]))
 					sb.WriteString("\n")
 
 					sb.WriteString(
-						fmt.Sprintf("#### Output\n\n"),
+						fmt.Sprintf("#### Output%s\n\n", suffix),
 					)
 					sb.WriteString(renderCodeBlock(r[1]))
 					sb.WriteString("\n")
